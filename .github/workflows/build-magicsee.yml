@@ -1,0 +1,169 @@
+#==========================================================================
+# Magicsee N5 Max X4 (model 602, board magicsee-n5-max-x4)
+#
+# 1. Build the kernel_magicsee bundle: ophub kernel_s905x4/<kver> + the box's
+#    WiFi/BT drivers + its DTB (magicsee/build-kernel-bundle.sh)
+# 2. Optionally publish it to the kernel_magicsee release (used by rebuild -r
+#    and by armbian-update on the box)
+# 3. Optionally build the Armbian image from the latest ophub trunk base image
+#    (rebuild + magicsee/build-image-post.sh) and publish or keep it as an artifact
+#
+# Runs on an arm64 runner, so drivers build natively and the image chroot needs no qemu.
+# See FLOW.magicsee-n5-max-x4.md.
+#==========================================================================
+
+name: Build Magicsee N5 Max X4
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Base kernel from ophub kernel_s905x4 (must have SC2 pinctrl/clocks)"
+        required: true
+        default: "6.18.59"
+      armbian_release:
+        description: "Armbian base image release"
+        required: true
+        default: "trixie"
+        type: choice
+        options: [trixie, bookworm, noble, resolute]
+      publish_kernel:
+        description: "Upload the bundle to the kernel_magicsee release"
+        type: boolean
+        default: true
+      build_image:
+        description: "Build the Armbian image"
+        type: boolean
+        default: true
+      publish_image:
+        description: "Upload the image to a release named after it, e.g. Armbian_26.11.0_amlogic_magicsee-n5-max-x4_trixie_6.18.59 (otherwise artifact only)"
+        type: boolean
+        default: false
+      wifi_ref:
+        description: "thanhnhu/wifi-amlogic-w1 branch or tag"
+        required: true
+        default: "6.18.40"
+      aml_bt_ref:
+        description: "thanhnhu/aml_bt branch or tag"
+        required: true
+        default: "6.18.40"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-magicsee
+  cancel-in-progress: false
+
+env:
+  TZ: Etc/UTC
+  BOARD: magicsee-n5-max-x4
+  KVER: ${{ inputs.kernel_version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare the runner
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
+          sudo apt-get -y update
+          sudo apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2604-build-armbian-depends)
+          sudo apt-get -y install --no-install-recommends build-essential bc bison flex libssl-dev libelf-dev \
+            kmod device-tree-compiler curl git patch python3 pigz
+          sudo apt-get clean
+          df -h /
+
+      - name: Fetch driver sources
+        run: |
+          mkdir -p ~/src
+          git clone -q --depth 1 -b "${{ inputs.wifi_ref }}" https://github.com/thanhnhu/wifi-amlogic-w1.git ~/src/wifi-amlogic-w1
+          git clone -q --depth 1 -b "${{ inputs.aml_bt_ref }}" https://github.com/thanhnhu/aml_bt.git ~/src/aml_bt
+          git -C ~/src/wifi-amlogic-w1 log --oneline -1
+          git -C ~/src/aml_bt log --oneline -1
+
+      - name: Build the kernel bundle
+        run: |
+          OUT="${GITHUB_WORKSPACE}/out" WORK="${RUNNER_TEMP}/magicsee-work" \
+            ./magicsee/build-kernel-bundle.sh "${KVER}"
+          ls -l out
+          tar -xzOf "out/${KVER}.tar.gz" "${KVER}/BUILDINFO"
+
+      - name: Publish the kernel bundle
+        if: ${{ inputs.publish_kernel }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view kernel_magicsee >/dev/null 2>&1 || \
+            gh release create kernel_magicsee --title kernel_magicsee --target "${GITHUB_REF_NAME}" \
+              --notes "Kernels for the Magicsee N5 Max X4 (model 602). Built by the build-magicsee workflow, see README.magicsee-n5-max-x4.md."
+          gh release upload kernel_magicsee "out/${KVER}.tar.gz" --clobber
+
+      - name: Download the Armbian base image
+        if: ${{ inputs.build_image }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.armbian_release }}
+        run: |
+          # latest *-trunk_*.img.gz of Armbian_<release>_arm64_server_* in ophub/amlogic-s9xxx-armbian
+          # (retried: the GitHub API occasionally drops the connection)
+          url=""
+          for i in 1 2 3; do
+            url=$(gh api "repos/ophub/amlogic-s9xxx-armbian/releases?per_page=30" --jq \
+              "[.[] | select(.tag_name | startswith(\"Armbian_${RELEASE}_arm64_server_\")) | .assets[]
+                | select((.name | contains(\"-trunk_\")) and (.name | endswith(\".img.gz\")))]
+                | sort_by(.updated_at) | last | .browser_download_url") && break
+            echo "GitHub API attempt ${i} failed, retrying"; sleep $((i * 10))
+          done
+          [[ -n "${url}" && "${url}" != "null" ]] || { echo "no ${RELEASE} trunk image found"; exit 1; }
+          echo "base image: ${url}"
+          mkdir -p build/output/images
+          curl -fsSL --retry 5 "${url}" | gzip -dc > "build/output/images/$(basename "${url%.gz}")"
+          ls -l build/output/images
+
+      - name: Build the Armbian image
+        if: ${{ inputs.build_image }}
+        run: |
+          mkdir -p build-armbian/kernel/magicsee
+          tar -xzf "out/${KVER}.tar.gz" -C build-armbian/kernel/magicsee/
+          sudo ./rebuild -b "${BOARD}" -k "${KVER}" -a false -r "${GITHUB_REPOSITORY}"
+          sudo rm -f build/output/images/*-trunk_*.img
+          img=$(ls build/output/images/Armbian_*_"${BOARD}"_*.img.gz)
+          sudo ./magicsee/build-image-post.sh "${img}"
+          sudo chown -R "$(id -u):$(id -g)" build/output/images
+          ls -l build/output/images
+          echo "IMAGE=${img}" >> "${GITHUB_ENV}"
+
+      - name: Upload the image as an artifact
+        if: ${{ inputs.build_image && !inputs.publish_image }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: armbian-${{ env.BOARD }}-${{ inputs.armbian_release }}-${{ inputs.kernel_version }}
+          path: |
+            build/output/images/Armbian_*.img.gz
+            build/output/images/Armbian_*.img.gz.sha256
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish the image
+        if: ${{ inputs.build_image && inputs.publish_image }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # one release per Armbian version / distro / kernel, named after the image:
+          # Armbian_26.11.0_amlogic_magicsee-n5-max-x4_trixie_6.18.59_server_2026.11.23.img.gz
+          #   -> Armbian_26.11.0_amlogic_magicsee-n5-max-x4_trixie_6.18.59
+          TAG=$(basename "${IMAGE}" | sed -E 's/_(server|desktop)_[0-9.]+\.img\.gz$//')
+          [[ "${TAG}" == Armbian_*_"${BOARD}"_* ]] || { echo "unexpected image name: ${IMAGE}"; exit 1; }
+          echo "release: ${TAG}"
+          gh release view "${TAG}" >/dev/null 2>&1 || \
+            gh release create "${TAG}" --title "${TAG}" --target "${GITHUB_REF_NAME}" \
+              --notes "Armbian images for the Magicsee N5 Max X4 (model 602). Write to a USB stick, hold the reset button in the AV jack while powering on. See README.magicsee-n5-max-x4.md."
+          gh release upload "${TAG}" "${IMAGE}" "${IMAGE}.sha256" --clobber

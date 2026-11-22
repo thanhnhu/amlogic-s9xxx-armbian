@@ -1046,8 +1046,8 @@ refactor_bootfs() {
             "${armbianenv_conf_file}"
     }
 
-    # Update config for model ID 601: x96-max-plus-ultra(s905x4)
-    [[ "${board}" == "x96-max-plus-ultra" && -f "${BOOT_CONF}" ]] && {
+    # Update config for model ID 601: x96-max-plus-ultra(s905x4), 602: magicsee-n5-max-x4(s905x4)
+    [[ "${board}" =~ ^(x96-max-plus-ultra|magicsee-n5-max-x4)$ && -f "${BOOT_CONF}" ]] && {
         sed -i \
             -e "s|^release=.*|release=${kernel_name}|g" \
             "${BOOT_CONF}"

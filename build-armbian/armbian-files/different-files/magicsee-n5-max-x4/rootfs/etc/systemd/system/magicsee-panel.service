@@ -1,0 +1,13 @@
+[Unit]
+Description=Magicsee N5 Max X4 front panel clock (FD6551)
+After=local-fs.target time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/magicsee-panel
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
